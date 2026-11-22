@@ -1,0 +1,8 @@
+<RCC>
+    <qresource prefix="/Gui">
+        <file alias="Main.qml">Gui/Ui/Main.qml</file>
+        <file alias="GrayButton.qml">Gui/Ui/GrayButton.qml</file>
+        <file alias="ToolBar.qml">Gui/Ui/ToolBar.qml</file>
+        <file alias="SegmentationsBrowser.qml">Gui/Ui/SegmentationsBrowser.qml</file>
+    </qresource>
+</RCC>

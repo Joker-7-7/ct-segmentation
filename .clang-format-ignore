@@ -1,0 +1,5 @@
+Backend/ThirdParty/**
+Backend/RLEImage/**
+out/**
+build/**
+build-*/**
