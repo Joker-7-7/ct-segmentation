@@ -292,6 +292,99 @@ namespace
         return gaussian;
     }
 
+    struct Accumulation
+    {
+        std::vector<Ort::Float16_t> logits;
+        std::vector<Ort::Float16_t> weights;
+    };
+
+    Accumulation RunPatches(
+        Ort::Session& session, const Volume& input, const ResamplePlan& plan,
+        const std::vector<float>& gaussian
+    )
+    {
+        const auto& resampled = plan.resampled;
+        const auto& padded = plan.padded;
+        const auto& pad = plan.pad;
+        const auto voxelCount = Dental::Count(padded);
+        const auto patchCount = Dental::Count(Patch);
+        Accumulation result{ std::vector<Ort::Float16_t>(ClassCount * voxelCount, Ort::Float16_t(0.f)),
+                             std::vector<Ort::Float16_t>(voxelCount, Ort::Float16_t(0.f)) };
+        std::vector<float> patch(patchCount);
+        const std::array<int64_t, 5> dimensions{ 1, 1, Patch[0], Patch[1], Patch[2] };
+        auto memory = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+        auto tensor = Ort::Value::CreateTensor<float>(
+            memory, patch.data(), patch.size(), dimensions.data(), dimensions.size()
+        );
+        const auto aSteps = Dental::Steps(padded[0], Patch[0]),
+                   bSteps = Dental::Steps(padded[1], Patch[1]),
+                   cSteps = Dental::Steps(padded[2], Patch[2]);
+        const auto total = aSteps.size() * bSteps.size() * cSteps.size();
+        std::size_t done = 0;
+        const char* inputs[]{ "image" };
+        const char* outputs[]{ "logits" };
+        for (int a : aSteps)
+        {
+            for (int b : bSteps)
+            {
+                for (int c : cSteps)
+                {
+                    for (int i = 0; i < Patch[0]; ++i)
+                    {
+                        for (int j = 0; j < Patch[1]; ++j)
+                        {
+                            for (int k = 0; k < Patch[2]; ++k)
+                            {
+                                const int y = a + i - pad[0], z = b + j - pad[1],
+                                          x = c + k - pad[2];
+                                patch[Offset(Patch, i, j, k)] =
+                                    y >= 0 && y < resampled[0] && z >= 0 && z < resampled[1] &&
+                                            x >= 0 && x < resampled[2]
+                                        ? input.data[Offset(resampled, y, z, x)]
+                                        : 0.f;
+                            }
+                        }
+                    }
+                    auto prediction =
+                        session.Run(Ort::RunOptions{ nullptr }, inputs, &tensor, 1, outputs, 1);
+                    if (prediction[0].GetTensorTypeAndShapeInfo().GetElementCount() !=
+                        ClassCount * patchCount)
+                    {
+                        throw std::runtime_error("Unexpected ONNX output tensor size");
+                    }
+                    const auto logits = prediction[0].GetTensorData<float>();
+                    for (int i = 0; i < Patch[0]; ++i)
+                    {
+                        for (int j = 0; j < Patch[1]; ++j)
+                        {
+                            for (int k = 0; k < Patch[2]; ++k)
+                            {
+                                const auto local = Offset(Patch, i, j, k),
+                                           global = Offset(padded, a + i, b + j, c + k);
+                                result.weights[global] =
+                                    Ort::Float16_t(result.weights[global].ToFloat() + gaussian[local]);
+                                for (int label = 0; label < ClassCount; ++label)
+                                {
+                                    const float value = logits[label * patchCount + local];
+                                    if (std::isfinite(value) == false)
+                                    {
+                                        throw std::runtime_error(
+                                            "Inference produced non-finite logits"
+                                        );
+                                    }
+                                    auto& sum = result.logits[label * voxelCount + global];
+                                    sum = Ort::Float16_t(sum.ToFloat() + value * gaussian[local]);
+                                }
+                            }
+                        }
+                    }
+                    std::cout << "Blocks " << ++done << "/" << total << std::endl;
+                }
+            }
+        }
+        return result;
+    }
+
     void RemoveIslands(Mask* mask)
     {
         using Binary = itk::Image<unsigned char, 3>;
@@ -369,82 +462,8 @@ namespace
         const auto modelPath = (directory + "/dental.onnx").toStdWString();
         Ort::Session session(environment, modelPath.c_str(), options);
         ValidateSession(session);
-        const auto patchCount = Dental::Count(Patch);
         const auto gaussian = LoadGaussian(directory);
-        std::vector<Ort::Float16_t> accumulated(ClassCount * voxelCount, Ort::Float16_t(0.f)),
-            weights(voxelCount, Ort::Float16_t(0.f));
-        std::vector<float> patch(patchCount);
-        const std::array<int64_t, 5> dimensions{ 1, 1, Patch[0], Patch[1], Patch[2] };
-        auto memory = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
-        auto tensor = Ort::Value::CreateTensor<float>(
-            memory, patch.data(), patch.size(), dimensions.data(), dimensions.size()
-        );
-        const auto aSteps = Dental::Steps(padded[0], Patch[0]),
-                   bSteps = Dental::Steps(padded[1], Patch[1]),
-                   cSteps = Dental::Steps(padded[2], Patch[2]);
-        const auto total = aSteps.size() * bSteps.size() * cSteps.size();
-        std::size_t done = 0;
-        const char* inputs[]{ "image" };
-        const char* outputs[]{ "logits" };
-        for (int a : aSteps)
-        {
-            for (int b : bSteps)
-            {
-                for (int c : cSteps)
-                {
-                    for (int i = 0; i < Patch[0]; ++i)
-                    {
-                        for (int j = 0; j < Patch[1]; ++j)
-                        {
-                            for (int k = 0; k < Patch[2]; ++k)
-                            {
-                                const int y = a + i - pad[0], z = b + j - pad[1],
-                                          x = c + k - pad[2];
-                                patch[Offset(Patch, i, j, k)] =
-                                    y >= 0 && y < resampled[0] && z >= 0 && z < resampled[1] &&
-                                            x >= 0 && x < resampled[2]
-                                        ? input.data[Offset(resampled, y, z, x)]
-                                        : 0.f;
-                            }
-                        }
-                    }
-                    auto prediction =
-                        session.Run(Ort::RunOptions{ nullptr }, inputs, &tensor, 1, outputs, 1);
-                    if (prediction[0].GetTensorTypeAndShapeInfo().GetElementCount() !=
-                        ClassCount * patchCount)
-                    {
-                        throw std::runtime_error("Unexpected ONNX output tensor size");
-                    }
-                    const auto logits = prediction[0].GetTensorData<float>();
-                    for (int i = 0; i < Patch[0]; ++i)
-                    {
-                        for (int j = 0; j < Patch[1]; ++j)
-                        {
-                            for (int k = 0; k < Patch[2]; ++k)
-                            {
-                                const auto local = Offset(Patch, i, j, k),
-                                           global = Offset(padded, a + i, b + j, c + k);
-                                weights[global] =
-                                    Ort::Float16_t(weights[global].ToFloat() + gaussian[local]);
-                                for (int label = 0; label < ClassCount; ++label)
-                                {
-                                    const float value = logits[label * patchCount + local];
-                                    if (std::isfinite(value) == false)
-                                    {
-                                        throw std::runtime_error(
-                                            "Inference produced non-finite logits"
-                                        );
-                                    }
-                                    auto& sum = accumulated[label * voxelCount + global];
-                                    sum = Ort::Float16_t(sum.ToFloat() + value * gaussian[local]);
-                                }
-                            }
-                        }
-                    }
-                    std::cout << "Blocks " << ++done << "/" << total << std::endl;
-                }
-            }
-        }
+        const auto accumulation = RunPatches(session, input, plan, gaussian);
         // Resample logits before argmax; resampling a discrete mask changes boundaries.
         std::vector<float> best(Dental::Count(cropped), -std::numeric_limits<float>::infinity());
         std::vector<unsigned short> labels(best.size(), 0);
@@ -459,8 +478,8 @@ namespace
                     {
                         const auto global = Offset(padded, y + pad[0], z + pad[1], x + pad[2]);
                         const float value = Ort::Float16_t(
-                                                accumulated[label * voxelCount + global].ToFloat() /
-                                                weights[global].ToFloat()
+                                                accumulation.logits[label * voxelCount + global].ToFloat() /
+                                                accumulation.weights[global].ToFloat()
                         )
                                                 .ToFloat();
                         if (std::isfinite(value) == false)
