@@ -33,6 +33,7 @@ namespace
     using Dental::Shape;
     using Dental::Volume;
     constexpr Shape Patch{ 128, 160, 112 };
+    constexpr int ClassCount = 6;
     struct ModelConfig
     {
         double mean;
@@ -58,13 +59,14 @@ namespace
         return doc.object();
     }
 
-    ModelConfig ValidateModel(const QString& directory)
+    ModelConfig ReadAndValidateModelConfig(const QString& directory)
     {
         const auto plans = ReadJson(directory + "/plans.json");
         const auto configuration = plans["configurations"].toObject()["3d_fullres"].toObject();
         if (plans["dataset_name"].toString() != "Dataset111_453CT" ||
             plans["transpose_forward"].toArray() != QJsonArray{ 1, 0, 2 } ||
-            configuration["patch_size"].toArray() != QJsonArray{ 128, 160, 112 } ||
+            configuration["patch_size"].toArray() !=
+                QJsonArray{ Patch[0], Patch[1], Patch[2] } ||
             configuration["normalization_schemes"].toArray() != QJsonArray{ "CTNormalization" })
         {
             throw std::runtime_error("Unsupported DentalSegmentator model configuration");
@@ -239,14 +241,55 @@ namespace
             plan.pad[a] = (plan.padded[a] - plan.resampled[a]) / 2;
         }
         const auto voxelCount = Dental::Count(plan.padded);
-        // Explicit bound before allocating six probability volumes; bad_alloc is also reported.
-        if (voxelCount > (std::size_t{ 8 } << 30) / (7 * sizeof(float)))
+        // Explicit bound before allocating probability volumes; bad_alloc is also reported.
+        if (voxelCount > (std::size_t{ 8 } << 30) / ((ClassCount + 1) * sizeof(float)))
         {
             throw std::runtime_error(
                 "CT requires more than 8 GiB of inference buffers; reduce the field of view"
             );
         }
         return plan;
+    }
+
+    void ValidateSession(const Ort::Session& session)
+    {
+        if (session.GetInputCount() != 1 || session.GetOutputCount() != 1 ||
+            session.GetInputTypeInfo(0).GetTensorTypeAndShapeInfo().GetShape() !=
+                std::vector<int64_t>{ 1, 1, Patch[0], Patch[1], Patch[2] } ||
+            session.GetOutputTypeInfo(0).GetTensorTypeAndShapeInfo().GetShape() !=
+                std::vector<int64_t>{ 1, ClassCount, Patch[0], Patch[1], Patch[2] })
+        {
+            throw std::runtime_error("Invalid ONNX input/output contract");
+        }
+        if (session.GetInputTypeInfo(0).GetTensorTypeAndShapeInfo().GetElementType() !=
+                ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
+            session.GetOutputTypeInfo(0).GetTensorTypeAndShapeInfo().GetElementType() !=
+                ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT)
+        {
+            throw std::runtime_error("ONNX tensors must contain float32 logits and input voxels");
+        }
+    }
+
+    std::vector<float> LoadGaussian(const QString& directory)
+    {
+        const auto patchCount = Dental::Count(Patch);
+        std::vector<float> gaussian(patchCount);
+        QFile gaussianFile(directory + "/gaussian.bin");
+        if (gaussianFile.open(QIODevice::ReadOnly) == false ||
+            gaussianFile.size() != static_cast<qint64>(patchCount * sizeof(float)) ||
+            gaussianFile.read(reinterpret_cast<char*>(gaussian.data()), gaussianFile.size()) !=
+                gaussianFile.size())
+        {
+            throw std::runtime_error("Missing gaussian.bin; run the model exporter");
+        }
+        for (float weight : gaussian)
+        {
+            if (std::isfinite(weight) == false || weight <= 0)
+            {
+                throw std::runtime_error("Invalid Gaussian weights");
+            }
+        }
+        return gaussian;
     }
 
     void RemoveIslands(Mask* mask)
@@ -292,7 +335,7 @@ namespace
 
     Mask::Pointer Predict(Image* image, const QString& directory, const QString& device)
     {
-        const auto model = ValidateModel(directory);
+        const auto model = ReadAndValidateModelConfig(directory);
         const auto crop = FindCropRegion(image);
         auto input = NormalizeCrop(image, crop, model);
         const auto plan = MakeResamplePlan(crop, image, model);
@@ -325,42 +368,13 @@ namespace
         }
         const auto modelPath = (directory + "/dental.onnx").toStdWString();
         Ort::Session session(environment, modelPath.c_str(), options);
-        if (session.GetInputCount() != 1 || session.GetOutputCount() != 1 ||
-            session.GetInputTypeInfo(0).GetTensorTypeAndShapeInfo().GetShape() !=
-                std::vector<int64_t>{ 1, 1, 128, 160, 112 } ||
-            session.GetOutputTypeInfo(0).GetTensorTypeAndShapeInfo().GetShape() !=
-                std::vector<int64_t>{ 1, 6, 128, 160, 112 })
-        {
-            throw std::runtime_error("Invalid ONNX input/output contract");
-        }
-        if (session.GetInputTypeInfo(0).GetTensorTypeAndShapeInfo().GetElementType() !=
-                ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
-            session.GetOutputTypeInfo(0).GetTensorTypeAndShapeInfo().GetElementType() !=
-                ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT)
-        {
-            throw std::runtime_error("ONNX tensors must contain float32 logits and input voxels");
-        }
+        ValidateSession(session);
         const auto patchCount = Dental::Count(Patch);
-        std::vector<float> gaussian(patchCount);
-        QFile gaussianFile(directory + "/gaussian.bin");
-        if (gaussianFile.open(QIODevice::ReadOnly) == false ||
-            gaussianFile.size() != static_cast<qint64>(patchCount * sizeof(float)) ||
-            gaussianFile.read(reinterpret_cast<char*>(gaussian.data()), gaussianFile.size()) !=
-                gaussianFile.size())
-        {
-            throw std::runtime_error("Missing gaussian.bin; run the model exporter");
-        }
-        for (float weight : gaussian)
-        {
-            if (std::isfinite(weight) == false || weight <= 0)
-            {
-                throw std::runtime_error("Invalid Gaussian weights");
-            }
-        }
-        std::vector<Ort::Float16_t> accumulated(6 * voxelCount, Ort::Float16_t(0.f)),
+        const auto gaussian = LoadGaussian(directory);
+        std::vector<Ort::Float16_t> accumulated(ClassCount * voxelCount, Ort::Float16_t(0.f)),
             weights(voxelCount, Ort::Float16_t(0.f));
         std::vector<float> patch(patchCount);
-        const std::array<int64_t, 5> dimensions{ 1, 1, 128, 160, 112 };
+        const std::array<int64_t, 5> dimensions{ 1, 1, Patch[0], Patch[1], Patch[2] };
         auto memory = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
         auto tensor = Ort::Value::CreateTensor<float>(
             memory, patch.data(), patch.size(), dimensions.data(), dimensions.size()
@@ -397,7 +411,7 @@ namespace
                     auto prediction =
                         session.Run(Ort::RunOptions{ nullptr }, inputs, &tensor, 1, outputs, 1);
                     if (prediction[0].GetTensorTypeAndShapeInfo().GetElementCount() !=
-                        6 * patchCount)
+                        ClassCount * patchCount)
                     {
                         throw std::runtime_error("Unexpected ONNX output tensor size");
                     }
@@ -412,7 +426,7 @@ namespace
                                            global = Offset(padded, a + i, b + j, c + k);
                                 weights[global] =
                                     Ort::Float16_t(weights[global].ToFloat() + gaussian[local]);
-                                for (int label = 0; label < 6; ++label)
+                                for (int label = 0; label < ClassCount; ++label)
                                 {
                                     const float value = logits[label * patchCount + local];
                                     if (std::isfinite(value) == false)
@@ -434,7 +448,7 @@ namespace
         // Resample logits before argmax; resampling a discrete mask changes boundaries.
         std::vector<float> best(Dental::Count(cropped), -std::numeric_limits<float>::infinity());
         std::vector<unsigned short> labels(best.size(), 0);
-        for (int label = 0; label < 6; ++label)
+        for (int label = 0; label < ClassCount; ++label)
         {
             Volume probabilities{ resampled, std::vector<float>(Dental::Count(resampled)) };
             for (int y = 0; y < resampled[0]; ++y)
