@@ -6,6 +6,11 @@ Built with C++17, Qt 6/QML, VTK, and ITK.
 
 The DICOM viewer and manual labeling work without model files. **Segment whole CT** requires the optional setup below.
 
+## Screenshots
+
+![Viewer](docs/images/screenshot-1.jpg)
+![Segmentation](docs/images/screenshot-2.jpg)
+
 ## Installation
 
 1. Install CMake, a C++17 compiler, and the required libraries: Qt 6 (Core, Quick, Network), VTK, ITK, and Boost 1.85 or newer. The current build targets Windows x64.
