@@ -33,6 +33,15 @@ namespace
     using Dental::Shape;
     using Dental::Volume;
     constexpr Shape Patch{ 128, 160, 112 };
+    struct ModelConfig
+    {
+        double mean;
+        double standardDeviation;
+        double clipLow;
+        double clipHigh;
+        std::array<double, 3> spacing;
+    };
+
     QJsonObject ReadJson(const QString& path)
     {
         QFile file(path);
@@ -49,7 +58,7 @@ namespace
         return doc.object();
     }
 
-    void ValidateModel(const QString& directory)
+    ModelConfig ValidateModel(const QString& directory)
     {
         const auto plans = ReadJson(directory + "/plans.json");
         const auto configuration = plans["configurations"].toObject()["3d_fullres"].toObject();
@@ -62,24 +71,33 @@ namespace
         }
         const auto stats =
             plans["foreground_intensity_properties_per_channel"].toObject()["0"].toObject();
-        if (stats["mean"].toDouble() != 1273.709228515625 ||
-            stats["std"].toDouble() != 558.4849853515625 ||
-            stats["percentile_00_5"].toDouble() != -110 ||
-            stats["percentile_99_5"].toDouble() != 3067)
+        constexpr ModelConfig supported{ 1273.709228515625,
+                                         558.4849853515625,
+                                         -110,
+                                         3067,
+                                         { 0.4492189884185791,
+                                           0.31200000643730164,
+                                           0.4492189884185791 } };
+        ModelConfig model{ stats["mean"].toDouble(),
+                           stats["std"].toDouble(),
+                           stats["percentile_00_5"].toDouble(),
+                           stats["percentile_99_5"].toDouble(),
+                           {} };
+        if (model.mean != supported.mean ||
+            model.standardDeviation != supported.standardDeviation ||
+            model.clipLow != supported.clipLow || model.clipHigh != supported.clipHigh)
         {
             throw std::runtime_error("Unsupported model normalization");
         }
         const auto spacing = configuration["spacing"].toArray();
-        const std::array<double, 3> expected{ 0.4492189884185791,
-                                              0.31200000643730164,
-                                              0.4492189884185791 };
         if (spacing.size() != 3)
         {
             throw std::runtime_error("Missing model spacing");
         }
         for (int i = 0; i < 3; ++i)
         {
-            if (spacing[i].toDouble() != expected[i])
+            model.spacing[i] = spacing[i].toDouble();
+            if (model.spacing[i] != supported.spacing[i])
             {
                 throw std::runtime_error("Unsupported model spacing");
             }
@@ -94,6 +112,7 @@ namespace
         {
             throw std::runtime_error("Unsupported model labels");
         }
+        return model;
     }
 
     std::size_t Offset(const Shape& s, int a, int b, int c)
@@ -144,7 +163,7 @@ namespace
 
     Mask::Pointer Predict(Image* image, const QString& directory, const QString& device)
     {
-        ValidateModel(directory);
+        const auto model = ValidateModel(directory);
         const auto size = image->GetLargestPossibleRegion().GetSize();
         for (int i = 0; i < 3; ++i)
         {
@@ -189,6 +208,10 @@ namespace
             cropped[a] = upper[a] - lower[a];
         }
         Volume input{ cropped, std::vector<float>(Dental::Count(cropped)) };
+        const float clipLow = static_cast<float>(model.clipLow);
+        const float clipHigh = static_cast<float>(model.clipHigh);
+        const float mean = static_cast<float>(model.mean);
+        const float standardDeviation = static_cast<float>(model.standardDeviation);
         for (int y = 0; y < cropped[0]; ++y)
         {
             for (int z = 0; z < cropped[1]; ++z)
@@ -200,20 +223,17 @@ namespace
                              size[0] +
                          x + lower[2]];
                     input.data[Offset(cropped, y, z, x)] =
-                        (std::clamp(v, -110.f, 3067.f) - 1273.709228515625f) / 558.4849853515625f;
+                        (std::clamp(v, clipLow, clipHigh) - mean) / standardDeviation;
                 }
             }
         }
         const std::array<double, 3> spacing{ image->GetSpacing()[1],
                                              image->GetSpacing()[2],
                                              image->GetSpacing()[0] };
-        const std::array<double, 3> targetSpacing{ 0.4492189884185791,
-                                                   0.31200000643730164,
-                                                   0.4492189884185791 };
         Shape resampled;
         for (int a = 0; a < 3; ++a)
         {
-            const double n = std::nearbyint(cropped[a] * spacing[a] / targetSpacing[a]);
+            const double n = std::nearbyint(cropped[a] * spacing[a] / model.spacing[a]);
             if (n < 1 || n > std::numeric_limits<int>::max())
             {
                 throw std::runtime_error("Unsupported resampled dimensions");
