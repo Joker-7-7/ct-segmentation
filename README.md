@@ -9,6 +9,7 @@ The DICOM viewer and manual labeling work without model files. **Segment whole C
 ## Screenshots
 
 ![Viewer](docs/images/screenshot-1.jpg)
+
 ![Segmentation](docs/images/screenshot-2.jpg)
 
 ## Installation
