@@ -120,6 +120,135 @@ namespace
         return (static_cast<std::size_t>(a) * s[1] + b) * s[2] + c;
     }
 
+    struct CropRegion
+    {
+        Shape origin;
+        Shape shape;
+    };
+
+    CropRegion FindCropRegion(const Image* image)
+    {
+        const auto size = image->GetLargestPossibleRegion().GetSize();
+        for (int i = 0; i < 3; ++i)
+        {
+            if (size[i] == 0 || size[i] > std::numeric_limits<int>::max() ||
+                std::isfinite(image->GetSpacing()[i]) == false || image->GetSpacing()[i] <= 0)
+            {
+                throw std::runtime_error("Invalid CT dimensions or spacing");
+            }
+        }
+        const Shape full{ static_cast<int>(size[1]),
+                          static_cast<int>(size[2]),
+                          static_cast<int>(size[0]) };
+        Shape lower = full, upper{ 0, 0, 0 };
+        const auto source = image->GetBufferPointer();
+        for (int y = 0; y < full[0]; ++y)
+        {
+            for (int z = 0; z < full[1]; ++z)
+            {
+                for (int x = 0; x < full[2]; ++x)
+                {
+                    const auto value =
+                        source[(static_cast<std::size_t>(z) * size[1] + y) * size[0] + x];
+                    if (std::isfinite(value) == false)
+                    {
+                        throw std::runtime_error("CT contains non-finite intensities");
+                    }
+                    if (value != 0)
+                    {
+                        const Shape p{ y, z, x };
+                        for (int a = 0; a < 3; ++a)
+                        {
+                            lower[a] = std::min(lower[a], p[a]);
+                            upper[a] = std::max(upper[a], p[a] + 1);
+                        }
+                    }
+                }
+            }
+        }
+        Shape cropped;
+        for (int a = 0; a < 3; ++a)
+        {
+            cropped[a] = upper[a] - lower[a];
+        }
+        return { lower, cropped };
+    }
+
+    Volume NormalizeCrop(const Image* image, const CropRegion& crop, const ModelConfig& model)
+    {
+        const auto size = image->GetLargestPossibleRegion().GetSize();
+        Volume input{ crop.shape, std::vector<float>(Dental::Count(crop.shape)) };
+        const float clipLow = static_cast<float>(model.clipLow);
+        const float clipHigh = static_cast<float>(model.clipHigh);
+        const float mean = static_cast<float>(model.mean);
+        const float standardDeviation = static_cast<float>(model.standardDeviation);
+        const auto source = image->GetBufferPointer();
+        for (int y = 0; y < crop.shape[0]; ++y)
+        {
+            for (int z = 0; z < crop.shape[1]; ++z)
+            {
+                for (int x = 0; x < crop.shape[2]; ++x)
+                {
+                    const float v = source
+                        [(static_cast<std::size_t>(z + crop.origin[1]) * size[1] +
+                          y + crop.origin[0]) * size[0] + x + crop.origin[2]];
+                    input.data[Offset(crop.shape, y, z, x)] =
+                        (std::clamp(v, clipLow, clipHigh) - mean) / standardDeviation;
+                }
+            }
+        }
+        return input;
+    }
+
+    struct ResamplePlan
+    {
+        Shape resampled;
+        Shape padded;
+        Shape pad;
+        int separateAxis;
+    };
+
+    ResamplePlan MakeResamplePlan(
+        const CropRegion& crop, const Image* image, const ModelConfig& model
+    )
+    {
+        const std::array<double, 3> spacing{ image->GetSpacing()[1],
+                                             image->GetSpacing()[2],
+                                             image->GetSpacing()[0] };
+        ResamplePlan plan{};
+        for (int a = 0; a < 3; ++a)
+        {
+            const double n = std::nearbyint(crop.shape[a] * spacing[a] / model.spacing[a]);
+            if (n < 1 || n > std::numeric_limits<int>::max())
+            {
+                throw std::runtime_error("Unsupported resampled dimensions");
+            }
+            plan.resampled[a] = static_cast<int>(n);
+        }
+        // A unique low-resolution axis is resampled separately in nnU-Net.
+        plan.separateAxis = -1;
+        const auto limits = std::minmax_element(spacing.begin(), spacing.end());
+        if (*limits.second / *limits.first > 3 &&
+            std::count(spacing.begin(), spacing.end(), *limits.second) == 1)
+        {
+            plan.separateAxis = static_cast<int>(limits.second - spacing.begin());
+        }
+        for (int a = 0; a < 3; ++a)
+        {
+            plan.padded[a] = std::max(plan.resampled[a], Patch[a]);
+            plan.pad[a] = (plan.padded[a] - plan.resampled[a]) / 2;
+        }
+        const auto voxelCount = Dental::Count(plan.padded);
+        // Explicit bound before allocating six probability volumes; bad_alloc is also reported.
+        if (voxelCount > (std::size_t{ 8 } << 30) / (7 * sizeof(float)))
+        {
+            throw std::runtime_error(
+                "CT requires more than 8 GiB of inference buffers; reduce the field of view"
+            );
+        }
+        return plan;
+    }
+
     void RemoveIslands(Mask* mask)
     {
         using Binary = itk::Image<unsigned char, 3>;
@@ -164,104 +293,16 @@ namespace
     Mask::Pointer Predict(Image* image, const QString& directory, const QString& device)
     {
         const auto model = ValidateModel(directory);
-        const auto size = image->GetLargestPossibleRegion().GetSize();
-        for (int i = 0; i < 3; ++i)
-        {
-            if (size[i] == 0 || size[i] > std::numeric_limits<int>::max() ||
-                std::isfinite(image->GetSpacing()[i]) == false || image->GetSpacing()[i] <= 0)
-            {
-                throw std::runtime_error("Invalid CT dimensions or spacing");
-            }
-        }
-        const Shape full{ static_cast<int>(size[1]),
-                          static_cast<int>(size[2]),
-                          static_cast<int>(size[0]) };
-        Shape lower = full, upper{ 0, 0, 0 };
-        const auto source = image->GetBufferPointer();
-        for (int y = 0; y < full[0]; ++y)
-        {
-            for (int z = 0; z < full[1]; ++z)
-            {
-                for (int x = 0; x < full[2]; ++x)
-                {
-                    const auto value =
-                        source[(static_cast<std::size_t>(z) * size[1] + y) * size[0] + x];
-                    if (std::isfinite(value) == false)
-                    {
-                        throw std::runtime_error("CT contains non-finite intensities");
-                    }
-                    if (value != 0)
-                    {
-                        const Shape p{ y, z, x };
-                        for (int a = 0; a < 3; ++a)
-                        {
-                            lower[a] = std::min(lower[a], p[a]);
-                            upper[a] = std::max(upper[a], p[a] + 1);
-                        }
-                    }
-                }
-            }
-        }
-        Shape cropped;
-        for (int a = 0; a < 3; ++a)
-        {
-            cropped[a] = upper[a] - lower[a];
-        }
-        Volume input{ cropped, std::vector<float>(Dental::Count(cropped)) };
-        const float clipLow = static_cast<float>(model.clipLow);
-        const float clipHigh = static_cast<float>(model.clipHigh);
-        const float mean = static_cast<float>(model.mean);
-        const float standardDeviation = static_cast<float>(model.standardDeviation);
-        for (int y = 0; y < cropped[0]; ++y)
-        {
-            for (int z = 0; z < cropped[1]; ++z)
-            {
-                for (int x = 0; x < cropped[2]; ++x)
-                {
-                    const float v = source
-                        [(static_cast<std::size_t>(z + lower[1]) * size[1] + y + lower[0]) *
-                             size[0] +
-                         x + lower[2]];
-                    input.data[Offset(cropped, y, z, x)] =
-                        (std::clamp(v, clipLow, clipHigh) - mean) / standardDeviation;
-                }
-            }
-        }
-        const std::array<double, 3> spacing{ image->GetSpacing()[1],
-                                             image->GetSpacing()[2],
-                                             image->GetSpacing()[0] };
-        Shape resampled;
-        for (int a = 0; a < 3; ++a)
-        {
-            const double n = std::nearbyint(cropped[a] * spacing[a] / model.spacing[a]);
-            if (n < 1 || n > std::numeric_limits<int>::max())
-            {
-                throw std::runtime_error("Unsupported resampled dimensions");
-            }
-            resampled[a] = static_cast<int>(n);
-        }
-        // A unique low-resolution axis is resampled separately in nnU-Net.
-        int separateAxis = -1;
-        const auto limits = std::minmax_element(spacing.begin(), spacing.end());
-        if (*limits.second / *limits.first > 3 &&
-            std::count(spacing.begin(), spacing.end(), *limits.second) == 1)
-        {
-            separateAxis = static_cast<int>(limits.second - spacing.begin());
-        }
-        Shape padded, pad;
-        for (int a = 0; a < 3; ++a)
-        {
-            padded[a] = std::max(resampled[a], Patch[a]);
-            pad[a] = (padded[a] - resampled[a]) / 2;
-        }
+        const auto crop = FindCropRegion(image);
+        auto input = NormalizeCrop(image, crop, model);
+        const auto plan = MakeResamplePlan(crop, image, model);
+        const auto& cropped = crop.shape;
+        const auto& lower = crop.origin;
+        const auto& resampled = plan.resampled;
+        const auto& padded = plan.padded;
+        const auto& pad = plan.pad;
+        const auto separateAxis = plan.separateAxis;
         const auto voxelCount = Dental::Count(padded);
-        // Explicit bound before allocating six probability volumes; bad_alloc is also reported.
-        if (voxelCount > (std::size_t{ 8 } << 30) / (7 * sizeof(float)))
-        {
-            throw std::runtime_error(
-                "CT requires more than 8 GiB of inference buffers; reduce the field of view"
-            );
-        }
         std::cout << "Preparing volume" << std::endl;
         input = Dental::Resize(input, resampled, 3, separateAxis);
         Ort::Env environment(ORT_LOGGING_LEVEL_WARNING, "DentalSegmentator");
@@ -432,6 +473,7 @@ namespace
         result->SetRegions(image->GetLargestPossibleRegion());
         result->Allocate(true);
         auto output = result->GetBufferPointer();
+        const auto size = image->GetLargestPossibleRegion().GetSize();
         for (int y = 0; y < cropped[0]; ++y)
         {
             for (int z = 0; z < cropped[1]; ++z)
