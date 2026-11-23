@@ -1,9 +1,12 @@
 #include "LabelMeshBuilder.hpp"
 
 #include <vtkImageData.h>
+#include <vtkImageGaussianSmooth.h>
 #include <vtkDiscreteFlyingEdges3D.h>
+#include <vtkFlyingEdges3D.h>
 #include <vtkPolyData.h>
 #include <vtkPolyDataNormals.h>
+#include <vtkWindowedSincPolyDataFilter.h>
 #include <itkImageRegionConstIterator.h>
 #include <algorithm>
 
@@ -79,22 +82,22 @@ LabelMeshBuilder::Meshes LabelMeshBuilder::Build(
         int low[3], high[3];
         for (int axis = 0; axis < 3; ++axis)
         {
-            // A zero border also closes surfaces touching the volume boundary.
-            low[axis] = box.low[axis] - 1;
-            high[axis] = box.high[axis] + 1;
+            // Keep the Gaussian kernel away from the cropped image boundary.
+            low[axis] = box.low[axis] - 4;
+            high[axis] = box.high[axis] + 4;
         }
         auto image = vtkSmartPointer<vtkImageData>::New();
         image->SetExtent(low[0], high[0], low[1], high[1], low[2], high[2]);
         image->SetSpacing(mask->GetSpacing().GetDataPointer());
         image->SetOrigin(mask->GetOrigin().GetDataPointer());
         image->SetDirectionMatrix(matrix);
-        image->AllocateScalars(VTK_UNSIGNED_CHAR, 1);
+        image->AllocateScalars(VTK_FLOAT, 1);
         for (int z = low[2]; z <= high[2]; ++z)
         {
             for (int y = low[1]; y <= high[1]; ++y)
             {
-                auto* pixels = static_cast<unsigned char*>(image->GetScalarPointer(low[0], y, z));
-                std::fill_n(pixels, high[0] - low[0] + 1, 0);
+                auto* pixels = static_cast<float*>(image->GetScalarPointer(low[0], y, z));
+                std::fill_n(pixels, high[0] - low[0] + 1, 0.0f);
                 if (y < start[1] || y >= start[1] + static_cast<int>(size[1]) || z < start[2] ||
                     z >= start[2] + static_cast<int>(size[2]))
                 {
@@ -110,26 +113,47 @@ LabelMeshBuilder::Meshes LabelMeshBuilder::Build(
                         const int to = std::min(x + static_cast<int>(run.first), high[0] + 1);
                         if (from < to)
                         {
-                            std::fill_n(pixels + from - low[0], to - from, 1);
+                            std::fill_n(pixels + from - low[0], to - from, 1.0f);
                         }
                     }
                     x += run.first;
                 }
             }
         }
-        auto surface = vtkSmartPointer<vtkDiscreteFlyingEdges3D>::New();
-        surface->SetInputData(image);
-        surface->SetValue(0, 1);
-        surface->ComputeScalarsOff();
-        surface->ComputeGradientsOff();
-        surface->ComputeNormalsOff();
-        surface->Update();
-        if (surface->GetOutput()->GetNumberOfPoints() == 0)
+        auto blurred = vtkSmartPointer<vtkImageGaussianSmooth>::New();
+        blurred->SetInputData(image);
+        blurred->SetStandardDeviation(1.4);
+        blurred->SetRadiusFactor(2.0);
+
+        auto contour = vtkSmartPointer<vtkFlyingEdges3D>::New();
+        contour->SetInputConnection(blurred->GetOutputPort());
+        contour->SetValue(0, 0.5);
+        contour->ComputeScalarsOff();
+        contour->ComputeGradientsOff();
+        contour->ComputeNormalsOff();
+        contour->Update();
+        vtkSmartPointer<vtkPolyData> surface = contour->GetOutput();
+        if (surface->GetNumberOfPoints() == 0)
         {
-            continue;
+            // Very small labels can disappear at the 0.5 contour level.
+            auto discrete = vtkSmartPointer<vtkDiscreteFlyingEdges3D>::New();
+            discrete->SetInputData(image);
+            discrete->SetValue(0, 1);
+            discrete->ComputeScalarsOff();
+            discrete->ComputeGradientsOff();
+            discrete->ComputeNormalsOff();
+            discrete->Update();
+            surface = discrete->GetOutput();
         }
+        auto smooth = vtkSmartPointer<vtkWindowedSincPolyDataFilter>::New();
+        smooth->SetInputData(surface);
+        smooth->SetNumberOfIterations(10);
+        smooth->SetPassBand(0.03);
+        smooth->NormalizeCoordinatesOn();
+        smooth->BoundarySmoothingOff();
+        smooth->FeatureEdgeSmoothingOff();
         auto normals = vtkSmartPointer<vtkPolyDataNormals>::New();
-        normals->SetInputConnection(surface->GetOutputPort());
+        normals->SetInputConnection(smooth->GetOutputPort());
         normals->ConsistencyOn();
         normals->SplittingOff();
         normals->AutoOrientNormalsOn();
