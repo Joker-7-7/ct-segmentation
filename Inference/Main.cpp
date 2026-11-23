@@ -385,6 +385,56 @@ namespace
         return result;
     }
 
+    std::vector<unsigned short> DecodeLabels(
+        const Accumulation& accumulation, const ResamplePlan& plan, const Shape& cropped
+    )
+    {
+        const auto& resampled = plan.resampled;
+        const auto& padded = plan.padded;
+        const auto& pad = plan.pad;
+        const auto separateAxis = plan.separateAxis;
+        const auto voxelCount = Dental::Count(padded);
+        // Resample logits before argmax; resampling a discrete mask changes boundaries.
+        std::vector<float> best(Dental::Count(cropped), -std::numeric_limits<float>::infinity());
+        std::vector<unsigned short> labels(best.size(), 0);
+        for (int label = 0; label < ClassCount; ++label)
+        {
+            Volume probabilities{ resampled, std::vector<float>(Dental::Count(resampled)) };
+            for (int y = 0; y < resampled[0]; ++y)
+            {
+                for (int z = 0; z < resampled[1]; ++z)
+                {
+                    for (int x = 0; x < resampled[2]; ++x)
+                    {
+                        const auto global = Offset(padded, y + pad[0], z + pad[1], x + pad[2]);
+                        const float value = Ort::Float16_t(
+                                                accumulation.logits[label * voxelCount + global].ToFloat() /
+                                                accumulation.weights[global].ToFloat()
+                        )
+                                                .ToFloat();
+                        if (std::isfinite(value) == false)
+                        {
+                            throw std::runtime_error("Non-finite accumulated logits");
+                        }
+                        probabilities.data[Offset(resampled, y, z, x)] = value;
+                    }
+                }
+            }
+            probabilities = Dental::Resize(probabilities, cropped, 1, separateAxis);
+            for (std::size_t i = 0; i < best.size(); ++i)
+            {
+                const float value = Ort::Float16_t(probabilities.data[i]).ToFloat();
+                if (value > best[i])
+                {
+                    best[i] = value;
+                    labels[i] = static_cast<unsigned short>(label);
+                }
+            }
+        }
+        return labels;
+    }
+
+
     void RemoveIslands(Mask* mask)
     {
         using Binary = itk::Image<unsigned char, 3>;
@@ -426,21 +476,40 @@ namespace
         }
     }
 
+    Mask::Pointer WriteMask(Image* image, const CropRegion& crop, const std::vector<unsigned short>& labels)
+    {
+        const auto& cropped = crop.shape;
+        const auto& lower = crop.origin;
+        auto result = Mask::New();
+        result->CopyInformation(image);
+        result->SetRegions(image->GetLargestPossibleRegion());
+        result->Allocate(true);
+        auto output = result->GetBufferPointer();
+        const auto size = image->GetLargestPossibleRegion().GetSize();
+        for (int y = 0; y < cropped[0]; ++y)
+        {
+            for (int z = 0; z < cropped[1]; ++z)
+            {
+                for (int x = 0; x < cropped[2]; ++x)
+                {
+                    output
+                        [(static_cast<std::size_t>(z + lower[1]) * size[1] + y + lower[0]) *
+                             size[0] +
+                         x + lower[2]] = labels[Offset(cropped, y, z, x)];
+                }
+            }
+        }
+        return result;
+    }
+
     Mask::Pointer Predict(Image* image, const QString& directory, const QString& device)
     {
         const auto model = ReadAndValidateModelConfig(directory);
         const auto crop = FindCropRegion(image);
         auto input = NormalizeCrop(image, crop, model);
         const auto plan = MakeResamplePlan(crop, image, model);
-        const auto& cropped = crop.shape;
-        const auto& lower = crop.origin;
-        const auto& resampled = plan.resampled;
-        const auto& padded = plan.padded;
-        const auto& pad = plan.pad;
-        const auto separateAxis = plan.separateAxis;
-        const auto voxelCount = Dental::Count(padded);
         std::cout << "Preparing volume" << std::endl;
-        input = Dental::Resize(input, resampled, 3, separateAxis);
+        input = Dental::Resize(input, plan.resampled, 3, plan.separateAxis);
         Ort::Env environment(ORT_LOGGING_LEVEL_WARNING, "DentalSegmentator");
         Ort::SessionOptions options;
         options.SetIntraOpNumThreads(4);
@@ -464,62 +533,8 @@ namespace
         ValidateSession(session);
         const auto gaussian = LoadGaussian(directory);
         const auto accumulation = RunPatches(session, input, plan, gaussian);
-        // Resample logits before argmax; resampling a discrete mask changes boundaries.
-        std::vector<float> best(Dental::Count(cropped), -std::numeric_limits<float>::infinity());
-        std::vector<unsigned short> labels(best.size(), 0);
-        for (int label = 0; label < ClassCount; ++label)
-        {
-            Volume probabilities{ resampled, std::vector<float>(Dental::Count(resampled)) };
-            for (int y = 0; y < resampled[0]; ++y)
-            {
-                for (int z = 0; z < resampled[1]; ++z)
-                {
-                    for (int x = 0; x < resampled[2]; ++x)
-                    {
-                        const auto global = Offset(padded, y + pad[0], z + pad[1], x + pad[2]);
-                        const float value = Ort::Float16_t(
-                                                accumulation.logits[label * voxelCount + global].ToFloat() /
-                                                accumulation.weights[global].ToFloat()
-                        )
-                                                .ToFloat();
-                        if (std::isfinite(value) == false)
-                        {
-                            throw std::runtime_error("Non-finite accumulated logits");
-                        }
-                        probabilities.data[Offset(resampled, y, z, x)] = value;
-                    }
-                }
-            }
-            probabilities = Dental::Resize(probabilities, cropped, 1, separateAxis);
-            for (std::size_t i = 0; i < best.size(); ++i)
-            {
-                const float value = Ort::Float16_t(probabilities.data[i]).ToFloat();
-                if (value > best[i])
-                {
-                    best[i] = value;
-                    labels[i] = static_cast<unsigned short>(label);
-                }
-            }
-        }
-        auto result = Mask::New();
-        result->CopyInformation(image);
-        result->SetRegions(image->GetLargestPossibleRegion());
-        result->Allocate(true);
-        auto output = result->GetBufferPointer();
-        const auto size = image->GetLargestPossibleRegion().GetSize();
-        for (int y = 0; y < cropped[0]; ++y)
-        {
-            for (int z = 0; z < cropped[1]; ++z)
-            {
-                for (int x = 0; x < cropped[2]; ++x)
-                {
-                    output
-                        [(static_cast<std::size_t>(z + lower[1]) * size[1] + y + lower[0]) *
-                             size[0] +
-                         x + lower[2]] = labels[Offset(cropped, y, z, x)];
-                }
-            }
-        }
+        const auto labels = DecodeLabels(accumulation, plan, crop.shape);
+        auto result = WriteMask(image, crop, labels);
         std::cout << "Removing small islands" << std::endl;
         RemoveIslands(result);
         return result;
